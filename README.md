@@ -12,7 +12,7 @@ segundo processo, o inspetor.
 | Arquivo | Papel |
 |---|---|
 | `estado_compartilhado.h` / `.c` | biblioteca-monitor: o segmento, a primitiva e a API de domínio |
-| `servidor.c` | servidor TCP thread-por-conexão, dono do segmento |
+| `servidor.c` | servidor TCP thread-por-conexão (ou thread pool com `--pool`), dono do segmento |
 | `cliente.c` | cliente TCP interativo ou por argv |
 | `inspetor.c` | processo separado que anexa à mesma SHM, sem socket |
 | `testes/concorrencia.sh` | prova de que não há dupla reserva nem segmento órfão |
@@ -47,6 +47,13 @@ O cliente também aceita um comando direto por argv, útil em scripts:
 
 ```sh
 ./cliente 127.0.0.1 9000 RESERVE 12 luigi
+```
+
+Para usar o thread pool do bônus em vez de thread-por-conexão:
+
+```sh
+./servidor 9000 --pool        # 8 workers
+./servidor 9000 --pool 16     # 16 workers
 ```
 
 Encerre o servidor com `Ctrl+C`: ele destrói a primitiva e remove o segmento.
@@ -146,6 +153,12 @@ instalado **sem** `SA_RESTART` de propósito — assim o `accept` bloqueado reto
 servidor aguarda até 2 segundos pelas conexões em curso, para que nenhuma thread toque
 memória já liberada.
 
+Como um sinal dirigido ao processo é entregue a qualquer thread que não o bloqueie, as
+threads de trabalho bloqueiam `SIGINT` e `SIGTERM` com `pthread_sigmask`. Sem isso, o
+sinal poderia ser tratado por uma thread de conexão e a principal continuaria dormindo
+no `accept`. Como rede de segurança, o socket de escuta também tem `SO_RCVTIMEO`, então
+o laço reavalia a flag periodicamente mesmo que o `EINTR` não aconteça.
+
 `SIGPIPE` é ignorado: um cliente que desaparece no meio de uma resposta faz o `write`
 falhar com `EPIPE` e a thread encerra sozinha, sem derrubar o servidor.
 
@@ -213,3 +226,41 @@ metade — mesmo com 64 pares `CANCEL`/`RESERVE` em curso, ocupados + livres = 6
 
 A biblioteca também foi exercitada diretamente, fora da rede, com 8 processos × 16
 threads disputando os 64 recursos: exatamente 64 reservas efetivadas.
+
+A mesma suíte roda contra o thread pool, e o resultado é idêntico:
+
+```sh
+PORTA=9600 SHM=/lpii_tp3_pool SRV_ARGS="--pool 4" ./testes/concorrencia.sh
+```
+
+Quatro workers atendendo 50 clientes simultâneos continuam produzindo exatamente um
+`OK`, que é a condição que o bônus exige para valer.
+
+## Bônus: thread pool com fila de conexões
+
+`./servidor <porta> [nome_shm] --pool [N]` troca o `pthread_create` por conexão por
+`N` workers fixos (8 por padrão) consumindo uma fila de descritores. O modo padrão
+continua sendo thread-por-conexão.
+
+**A fila.** Buffer circular de capacidade fixa (128 descritores) com um
+`pthread_mutex_t` e duas variáveis de condição, `nao_vazia` e `nao_cheia`. A thread do
+`accept` é a única produtora; os workers são os consumidores. Toda espera está em laço
+`while`, e não em `if`, porque um worker acordado ainda precisa reconferir a condição:
+outro worker pode ter consumido o item entre o sinal e a reaquisição do mutex.
+
+Duas condvars em vez de uma evitam acordar quem não tem o que fazer — quem espera vaga
+na fila não é acordado por uma inserção. Quando a fila enche, o produtor bloqueia em
+`nao_cheia`, o que aplica contrapressão natural: as conexões ficam no backlog do
+`listen` em vez de consumirem memória do processo.
+
+**Encerramento.** `fila_fecha()` marca a fila como fechada e faz `broadcast` nas duas
+condvars. Os workers drenam o que ainda estava enfileirado, veem a fila vazia e
+fechada, e retornam — então o `pthread_join` de cada um termina. Para que um cliente
+ocioso não segure um worker (e o encerramento) para sempre, cada conexão aceita recebe
+`SO_RCVTIMEO` de 1 segundo: o `read` expira, a thread percebe a flag de encerramento e
+sai.
+
+**Correção.** A fila sincroniza apenas o repasse de descritores entre threads do mesmo
+processo e não tem relação nenhuma com a sincronização do estado compartilhado, que
+continua inteiramente dentro da biblioteca. É por isso que trocar o modelo de
+concorrência não abre janela para dupla reserva.
