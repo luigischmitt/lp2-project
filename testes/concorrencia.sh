@@ -105,8 +105,24 @@ echo "     $LINHA"
                          || falha "snapshot inconsistente (soma=$SOMA)"
 
 echo
-echo "4) limpeza no SIGINT"
+echo "4) limpeza no SIGINT com um cliente ocioso conectado"
+# Conexao aberta que nao envia nada: e o caso que travaria o encerramento se
+# uma thread ficasse presa para sempre no read.
+exec 3<>"/dev/tcp/$HOST/$PORTA"
 kill -INT "$SRV_PID"
+
+INICIO=$SECONDS
+while kill -0 "$SRV_PID" 2>/dev/null && [ $((SECONDS - INICIO)) -lt 10 ]; do
+    sleep 0.2
+done
+exec 3<&-
+
+if kill -0 "$SRV_PID" 2>/dev/null; then
+    falha "servidor nao encerrou em 10s (thread presa no read?)"
+    kill -9 "$SRV_PID" 2>/dev/null
+else
+    ok "servidor encerrou em $((SECONDS - INICIO))s mesmo com cliente ocioso"
+fi
 wait "$SRV_PID" 2>/dev/null
 SRV_PID=
 if [ -e "/dev/shm${SHM}" ]; then

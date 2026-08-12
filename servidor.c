@@ -309,6 +309,18 @@ static void executa(conexao *c, char *linha)
     responde(c->fd, "ERR comando desconhecido: %s", cmd);
 }
 
+/* Um sinal dirigido ao processo e entregue a qualquer thread que nao o
+ * bloqueie. Bloqueando SIGINT/SIGTERM nas threads de trabalho, a entrega recai
+ * sobre a thread principal, que e quem precisa acordar do accept. */
+static void bloqueia_sinais(void)
+{
+    sigset_t conjunto;
+    sigemptyset(&conjunto);
+    sigaddset(&conjunto, SIGINT);
+    sigaddset(&conjunto, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &conjunto, NULL);
+}
+
 /* Atende uma conexao ate o fim. Igual nos dois modos: a diferenca entre
  * thread-por-conexao e pool esta so em quem chama esta funcao. */
 static void atende_conexao(int fd, estado_t *estado)
@@ -340,6 +352,7 @@ static void atende_conexao(int fd, estado_t *estado)
 static void *thread_conexao(void *arg)
 {
     conexao *c = arg;
+    bloqueia_sinais();
     atende_conexao(c->fd, c->estado);
     free(c);
     return NULL;
@@ -350,6 +363,7 @@ static void *thread_worker(void *arg)
     estado_t *estado = arg;
     int fd;
 
+    bloqueia_sinais();
     while (fila_tira(&fd))
         atende_conexao(fd, estado);
 
@@ -364,6 +378,13 @@ static int abre_escuta(unsigned short porta)
 
     int sim = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &sim, sizeof sim);
+
+    /* Faz o accept expirar de tempos em tempos. O caminho normal de
+     * encerramento e o EINTR provocado pelo sinal; isto e a rede de seguranca
+     * para o caso de o sinal ter sido tratado enquanto a thread principal
+     * estava fora do accept. */
+    struct timeval espera = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &espera, sizeof espera);
 
     struct sockaddr_in end = {
         .sin_family = AF_INET,
@@ -500,8 +521,10 @@ int main(int argc, char **argv)
 
         int fd = accept(escuta, (struct sockaddr *)&cliente, &tam);
         if (fd < 0) {
-            if (errno == EINTR)
-                continue;          /* sinal chegou: o while reavalia a flag */
+            /* EINTR: o sinal chegou. EAGAIN: o SO_RCVTIMEO expirou. Em ambos
+             * os casos basta deixar o while reavaliar a flag de encerramento. */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
             perror("accept");
             continue;
         }

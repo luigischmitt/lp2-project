@@ -153,6 +153,12 @@ instalado **sem** `SA_RESTART` de propósito — assim o `accept` bloqueado reto
 servidor aguarda até 2 segundos pelas conexões em curso, para que nenhuma thread toque
 memória já liberada.
 
+Como um sinal dirigido ao processo é entregue a qualquer thread que não o bloqueie, as
+threads de trabalho bloqueiam `SIGINT` e `SIGTERM` com `pthread_sigmask`. Sem isso, o
+sinal poderia ser tratado por uma thread de conexão e a principal continuaria dormindo
+no `accept`. Como rede de segurança, o socket de escuta também tem `SO_RCVTIMEO`, então
+o laço reavalia a flag periodicamente mesmo que o `EINTR` não aconteça.
+
 `SIGPIPE` é ignorado: um cliente que desaparece no meio de uma resposta faz o `write`
 falhar com `EPIPE` e a thread encerra sozinha, sem derrubar o servidor.
 
