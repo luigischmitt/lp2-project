@@ -1,0 +1,5 @@
+*.o
+servidor
+cliente
+inspetor
+.DS_Store
