@@ -1,11 +1,15 @@
-/* servidor.c -- servidor TCP thread-por-conexao da central de reservas.
+/* servidor.c -- servidor TCP da central de reservas.
  *
- * Nao existe nenhuma primitiva de sincronizacao neste arquivo: todo acesso ao
- * estado compartilhado passa pela API de estado_compartilhado.h, que sincroniza
- * internamente. O servidor e o dono do segmento: cria na inicializacao e
- * remove ao receber SIGINT.
+ * Nao existe nenhuma primitiva de sincronizacao sobre o estado compartilhado
+ * neste arquivo: todo acesso passa pela API de estado_compartilhado.h, que
+ * sincroniza internamente. O servidor e o dono do segmento: cria na
+ * inicializacao e remove ao receber SIGINT.
  *
- *   ./servidor <porta> [nome_shm]
+ *   ./servidor <porta> [nome_shm] [--pool [N]]
+ *
+ * Por padrao usa thread-por-conexao. Com --pool, um numero fixo de workers
+ * consome uma fila de conexoes (bonus); o mutex e as condvars da fila sao
+ * locais ao processo e nao tem relacao com a sincronizacao da SHM.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -22,12 +26,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
-#define BACKLOG        64
-#define LINHA_MAX      512
-#define ESPERA_SAIDA_S 2
+#define BACKLOG          64
+#define LINHA_MAX        512
+#define ESPERA_SAIDA_S   2
+#define FILA_CAP         128
+#define WORKERS_PADRAO   8
+#define WORKERS_MAX      256
 
 /* O handler de sinal so pode mexer nisto: escrever em uma flag desse tipo e
  * uma das poucas operacoes async-signal-safe. A limpeza acontece no fluxo
@@ -49,10 +57,79 @@ typedef struct {
     size_t ini, fim;
 } leitor;
 
+/* Fila de conexoes do modo --pool: buffer circular classico de
+ * produtor-consumidor. A thread do accept e a unica produtora, os workers sao
+ * os consumidores. Duas condvars separadas evitam acordar quem nao tem o que
+ * fazer: quem espera vaga nao e acordado por uma insercao. */
+static struct {
+    int             fd[FILA_CAP];
+    size_t          ini, qtd;
+    pthread_mutex_t mutex;
+    pthread_cond_t  nao_vazia;
+    pthread_cond_t  nao_cheia;
+    int             fechada;
+} fila = {
+    .ini = 0, .qtd = 0,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .nao_vazia = PTHREAD_COND_INITIALIZER,
+    .nao_cheia = PTHREAD_COND_INITIALIZER,
+    .fechada = 0,
+};
+
 static void trata_sinal(int s)
 {
     (void)s;
     encerrar = 1;
+}
+
+static void fila_poe(int fd)
+{
+    pthread_mutex_lock(&fila.mutex);
+
+    while (fila.qtd == FILA_CAP && !fila.fechada)
+        pthread_cond_wait(&fila.nao_cheia, &fila.mutex);
+
+    if (fila.fechada) {
+        pthread_mutex_unlock(&fila.mutex);
+        close(fd);
+        return;
+    }
+
+    fila.fd[(fila.ini + fila.qtd) % FILA_CAP] = fd;
+    fila.qtd++;
+    pthread_cond_signal(&fila.nao_vazia);
+    pthread_mutex_unlock(&fila.mutex);
+}
+
+/* Devolve 1 com uma conexao, ou 0 quando a fila esvaziou e foi fechada. */
+static int fila_tira(int *fd)
+{
+    pthread_mutex_lock(&fila.mutex);
+
+    while (fila.qtd == 0 && !fila.fechada)
+        pthread_cond_wait(&fila.nao_vazia, &fila.mutex);
+
+    if (fila.qtd == 0) {          /* so acontece com a fila fechada */
+        pthread_mutex_unlock(&fila.mutex);
+        return 0;
+    }
+
+    *fd = fila.fd[fila.ini];
+    fila.ini = (fila.ini + 1) % FILA_CAP;
+    fila.qtd--;
+    pthread_cond_signal(&fila.nao_cheia);
+    pthread_mutex_unlock(&fila.mutex);
+    return 1;
+}
+
+/* Os workers drenam o que sobrou na fila e so entao encerram. */
+static void fila_fecha(void)
+{
+    pthread_mutex_lock(&fila.mutex);
+    fila.fechada = 1;
+    pthread_cond_broadcast(&fila.nao_vazia);
+    pthread_cond_broadcast(&fila.nao_cheia);
+    pthread_mutex_unlock(&fila.mutex);
 }
 
 static int escreve_tudo(int fd, const char *dado, size_t n)
@@ -103,6 +180,14 @@ static int le_linha(leitor *l, char *saida, size_t tam, int *truncada)
             if (k < 0) {
                 if (errno == EINTR)
                     continue;
+                /* SO_RCVTIMEO expirou: e a chance de um cliente ocioso notar
+                 * que o servidor esta encerrando, em vez de segurar a thread
+                 * (e o shutdown) indefinidamente. */
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (encerrar)
+                        return -1;
+                    continue;
+                }
                 return -1;
             }
             if (k == 0)
@@ -224,29 +309,50 @@ static void executa(conexao *c, char *linha)
     responde(c->fd, "ERR comando desconhecido: %s", cmd);
 }
 
-static void *atende(void *arg)
+/* Atende uma conexao ate o fim. Igual nos dois modos: a diferenca entre
+ * thread-por-conexao e pool esta so em quem chama esta funcao. */
+static void atende_conexao(int fd, estado_t *estado)
 {
-    conexao *c = arg;
-    leitor l = { .fd = c->fd, .ini = 0, .fim = 0 };
+    conexao c = { .fd = fd, .estado = estado };
+    leitor l = { .fd = fd, .ini = 0, .fim = 0 };
     char linha[LINHA_MAX];
     int truncada;
 
+    __atomic_fetch_add(&conexoes_ativas, 1, __ATOMIC_RELAXED);
+
     while (le_linha(&l, linha, sizeof linha, &truncada) == 1) {
         if (truncada) {
-            responde(c->fd, "ERR linha muito longa");
+            responde(fd, "ERR linha muito longa");
             continue;
         }
         if (strncmp(linha, "QUIT", 4) == 0 &&
             (linha[4] == '\0' || linha[4] == ' ')) {
-            responde(c->fd, "BYE");
+            responde(fd, "BYE");
             break;
         }
-        executa(c, linha);
+        executa(&c, linha);
     }
 
-    close(c->fd);
-    free(c);
+    close(fd);
     __atomic_fetch_sub(&conexoes_ativas, 1, __ATOMIC_RELAXED);
+}
+
+static void *thread_conexao(void *arg)
+{
+    conexao *c = arg;
+    atende_conexao(c->fd, c->estado);
+    free(c);
+    return NULL;
+}
+
+static void *thread_worker(void *arg)
+{
+    estado_t *estado = arg;
+    int fd;
+
+    while (fila_tira(&fd))
+        atende_conexao(fd, estado);
+
     return NULL;
 }
 
@@ -307,17 +413,39 @@ static void aguarda_conexoes(void)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "uso: %s <porta> [nome_shm]\n", argv[0]);
-        return 1;
+    const char *nome_shm = ESTADO_SHM_PADRAO;
+    int porta = -1, usa_pool = 0, workers = WORKERS_PADRAO, shm_definido = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--pool") == 0) {
+            usa_pool = 1;
+            int n;
+            if (i + 1 < argc && para_inteiro(argv[i + 1], &n)) {
+                if (n < 1 || n > WORKERS_MAX) {
+                    fprintf(stderr, "numero de workers invalido: %d\n", n);
+                    return 1;
+                }
+                workers = n;
+                i++;
+            }
+        } else if (porta < 0) {
+            if (!para_inteiro(argv[i], &porta) || porta < 1 || porta > 65535) {
+                fprintf(stderr, "porta invalida: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (!shm_definido) {
+            nome_shm = argv[i];
+            shm_definido = 1;
+        } else {
+            fprintf(stderr, "argumento inesperado: %s\n", argv[i]);
+            return 1;
+        }
     }
 
-    int porta;
-    if (!para_inteiro(argv[1], &porta) || porta < 1 || porta > 65535) {
-        fprintf(stderr, "porta invalida: %s\n", argv[1]);
+    if (porta < 0) {
+        fprintf(stderr, "uso: %s <porta> [nome_shm] [--pool [N]]\n", argv[0]);
         return 1;
     }
-    const char *nome_shm = (argc == 3) ? argv[2] : ESTADO_SHM_PADRAO;
 
     estado_t *estado = estado_criar(nome_shm);
     if (!estado) {
@@ -333,8 +461,37 @@ int main(int argc, char **argv)
     }
 
     instala_sinais();
-    printf("servidor ouvindo na porta %d, segmento %s (%d recursos)\n",
-           porta, nome_shm, ESTADO_N);
+
+    pthread_t *equipe = NULL;
+    if (usa_pool) {
+        equipe = calloc((size_t)workers, sizeof *equipe);
+        if (!equipe) {
+            perror("calloc");
+            close(escuta);
+            estado_destruir(estado);
+            return 1;
+        }
+        for (int i = 0; i < workers; i++) {
+            if (pthread_create(&equipe[i], NULL, thread_worker, estado) != 0) {
+                perror("pthread_create");
+                workers = i;   /* segue com os que subiram */
+                break;
+            }
+        }
+        if (workers == 0) {
+            fprintf(stderr, "nenhum worker pode ser criado\n");
+            free(equipe);
+            close(escuta);
+            estado_destruir(estado);
+            return 1;
+        }
+    }
+
+    printf("servidor ouvindo na porta %d, segmento %s (%d recursos), modo %s\n",
+           porta, nome_shm, ESTADO_N,
+           usa_pool ? "thread pool" : "thread-por-conexao");
+    if (usa_pool)
+        printf("pool: %d workers, fila com capacidade %d\n", workers, FILA_CAP);
     fflush(stdout);
 
     while (!encerrar) {
@@ -349,23 +506,28 @@ int main(int argc, char **argv)
             continue;
         }
 
-        conexao *c = malloc(sizeof *c);
-        if (!c) {
-            close(fd);
-            continue;
-        }
-        c->fd = fd;
-        c->estado = estado;
+        struct timeval espera = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &espera, sizeof espera);
 
-        pthread_t t;
-        __atomic_fetch_add(&conexoes_ativas, 1, __ATOMIC_RELAXED);
-        if (pthread_create(&t, NULL, atende, c) != 0) {
-            __atomic_fetch_sub(&conexoes_ativas, 1, __ATOMIC_RELAXED);
-            close(fd);
-            free(c);
-            continue;
+        if (usa_pool) {
+            fila_poe(fd);
+        } else {
+            conexao *c = malloc(sizeof *c);
+            if (!c) {
+                close(fd);
+                continue;
+            }
+            c->fd = fd;
+            c->estado = estado;
+
+            pthread_t t;
+            if (pthread_create(&t, NULL, thread_conexao, c) != 0) {
+                close(fd);
+                free(c);
+                continue;
+            }
+            pthread_detach(t);
         }
-        pthread_detach(t);
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &cliente.sin_addr, ip, sizeof ip);
@@ -375,6 +537,16 @@ int main(int argc, char **argv)
 
     printf("\nencerrando: liberando segmento %s\n", nome_shm);
     close(escuta);
+
+    if (usa_pool) {
+        /* Fechar a fila acorda os workers parados na condvar; eles drenam o
+         * que sobrou e retornam, entao o join termina. */
+        fila_fecha();
+        for (int i = 0; i < workers; i++)
+            pthread_join(equipe[i], NULL);
+        free(equipe);
+    }
+
     aguarda_conexoes();
     estado_destruir(estado);
     return 0;

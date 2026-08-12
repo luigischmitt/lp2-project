@@ -4,12 +4,18 @@
 #
 #   make && ./testes/concorrencia.sh
 #
+# Para exercitar o modo bonus (thread pool), passe os argumentos extras do
+# servidor em SRV_ARGS:
+#
+#   PORTA=9600 SHM=/lpii_tp3_pool SRV_ARGS="--pool 4" ./testes/concorrencia.sh
+#
 # Em macOS, rode dentro do container: ./dev.sh bash -c 'make && ./testes/concorrencia.sh'
 
 set -u
 
 PORTA=${PORTA:-9500}
 SHM=${SHM:-/lpii_tp3_teste}
+SRV_ARGS=${SRV_ARGS:-}
 HOST=127.0.0.1
 TMP=$(mktemp -d)
 FALHAS=0
@@ -32,10 +38,12 @@ for bin in servidor cliente inspetor; do
     [ -x "./$bin" ] || { echo "faltou compilar: ./$bin (rode make)"; exit 1; }
 done
 
-./servidor "$PORTA" "$SHM" >"$TMP/servidor.log" 2>&1 &
+# shellcheck disable=SC2086  # SRV_ARGS precisa ser dividido em palavras
+./servidor "$PORTA" "$SHM" $SRV_ARGS >"$TMP/servidor.log" 2>&1 &
 SRV_PID=$!
 sleep 0.5
 kill -0 "$SRV_PID" 2>/dev/null || { echo "servidor nao subiu:"; cat "$TMP/servidor.log"; exit 1; }
+head -2 "$TMP/servidor.log"
 
 echo
 echo "1) 50 clientes disputando o MESMO recurso"
